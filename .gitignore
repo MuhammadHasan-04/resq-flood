@@ -1,0 +1,24 @@
+# Data never goes in git (see data/README.md)
+data/*
+!data/README.md
+*.tif
+*.tiff
+*.gpkg
+*.zip
+outputs/
+runs/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+# Local config
+config/local.yaml
+.env
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

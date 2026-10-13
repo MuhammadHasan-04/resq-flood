@@ -1,0 +1,54 @@
+# ResQFlood shared configuration. Copy to config/local.yaml to override paths on your machine.
+paths:
+  # Folder with all Dadu data (the DADU_DATA folder). Relative paths are resolved from the repo root.
+  dadu_data: ../outputs/DADU_DATA
+  work: runs            # generated outputs (ignored by git)
+
+study_area:
+  name: Dadu district, Sindh
+  boundary: 01_Boundary/dadu_district_boundary_gadm41.geojson
+  pilot_sector: 01_Boundary/johi_dadu_pilot_sector.geojson
+  pilot_bbox: [67.35, 26.45, 68.05, 27.05]   # lon_min, lat_min, lon_max, lat_max
+  metric_crs: EPSG:32642                       # UTM 42N, for lengths and areas
+
+flood:
+  daily_masks_dir: 03_TU_Wien_Flood_Masks/a_daily_masks_clipped_to_Dadu
+  mask_values: {not_flooded: 0, flood: 1, nodata: 255}
+  default_date: "20220830_D078"
+  dates: [20220818_D078, 20220822_A144, 20220827_A042, 20220830_D078, 20220903_A144,
+          20220908_A042, 20220911_D078, 20220915_A144, 20220920_A042, 20220923_D078]
+  permanent_water: 06_JRC_Surface_Water/dadu_jrc_permanent_water_mask.tif
+
+sar:
+  out_dir: 02_Sentinel1_SAR/matched_scenes      # inside dadu_data
+  stac_url: https://planetarycomputer.microsoft.com/api/stac/v1
+  data_api: https://planetarycomputer.microsoft.com/api/data/v1
+  collection: sentinel-1-rtc
+  pixel_deg: 0.0003
+  tile_size: 256
+  split: {train: [20220818, 20220827, 20220830, 20220908, 20220911, 20220920], val: [20220903, 20220915], test: [20220822, 20220923]}
+
+roads:
+  file: 04_OSM_Network/geojson/dadu_osm_roads.geojson
+  sample_step_m: 20
+  state_rules:            # applied in this order
+    blocked_candidate: {flood_share_min: 0.5}
+    risky: {flood_share_min: 0.000001}
+    unknown: {unknown_share_min: 0.5}
+  cost: {flood_weight: 20.0, unknown_weight: 2.0}
+  k_alternatives: 3
+
+boat:
+  cell_deg: 0.00054
+  dem: 05_DEM_Copernicus_GLO30/clipped/dadu_dem_glo30_metres.tif
+  slope: 05_DEM_Copernicus_GLO30/clipped/dadu_slope_degrees.tif
+  jrc_occurrence: 06_JRC_Surface_Water/dadu_jrc_occurrence.tif
+  penalties: {dry: 60, road: 15, bridge: 25, masked: 8, dem_gap: 5, slope_gt2: 5, max_terrain: 20}
+  water_level_percentile: 75
+
+reports:
+  snap_distance_m: 50
+  duplicate_window_h: 2
+  duplicate_radius_m: 200
+  role_weights: {public: 0.4, ngo_worker: 0.7, field_team: 0.9, authority: 1.0}
+  accept_score: 0.6

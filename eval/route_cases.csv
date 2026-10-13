@@ -1,0 +1,3 @@
+case_id,start_name,start_lon,start_lat,end_name,end_lon,end_lat,mode,notes
+C01,Johi,67.6146,26.6927,Dadu city,67.7797,26.7311,road,re-defense PoC
+C02,Dadu launch,67.775,26.735,Jhandiani,67.781454,26.588606,boat,re-defense PoC
