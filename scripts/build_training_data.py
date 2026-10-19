@@ -160,22 +160,66 @@ def build_s1f(a, jrc, out):
     return res
 
 
+def build_dry(a, jrc, out):
+    """Dry-season (Jan-May 2022) Sentinel-1 RTC chips at train/val/test locations: teach the model what is NOT water.
+    Labels from 38 years of JRC water history: water = permanent water (1), never water in 38 years (0), else ignore."""
+    files = sorted(glob.glob(os.path.join(a.dry, "DRY_*.tif")))[a.start:a.stop]
+    meta = {}
+    for mf in glob.glob(os.path.join(a.dry, "dry_meta_part*.json")):
+        for m in json.load(open(mf)):
+            meta[m[0]] = m
+    (out / "sar").mkdir(parents=True, exist_ok=True)
+    (out / "labels").mkdir(parents=True, exist_ok=True)
+    res = []
+    for f in files:
+        stem = Path(f).stem                      # DRY_TW0359_20220420
+        loc = stem.split("_")[1]
+        m = meta.get(loc)
+        if m is None:
+            continue
+        with rasterio.open(f) as s:
+            lin = s.read().astype("float32")
+            T, crs = s.transform, s.crs
+        lin[lin <= -30000] = np.nan
+        stack, sar_ok = td.sar_stack(lin[0], lin[1], ENL["tuwien"])
+        occ, sea = jrc.layers(T, crs, lin.shape[1:])
+        perm = ((sea == 12) | ((occ != 255) & (occ >= 80)))
+        known = (occ != 255) | (sea != 255)
+        lab_ok = known & (perm | (occ == 0))
+        perm_u8 = np.where(known, perm, 255).astype("uint8")
+        labels = td.make_labels(perm.astype("uint8"), lab_ok, sar_ok, perm_u8, label_includes_permanent=True)
+        cid = stem
+        tags = dict(source="Sentinel-1 RTC gamma0 (Planetary Computer), dry season 2022; labels from JRC GSW",
+                    acquisition=m[5], item=m[4])
+        td.write_chip(out / "sar" / f"{cid}.tif", out / "labels" / f"{cid}.tif", stack, labels, T, crs, tags)
+        st = td.chip_stats(labels)
+        res.append(dict(chip_id=cid, dataset="dry_season_2022", label_type="jrc_dry_season", date=stem.split("_")[2],
+                        acquisition=m[5], orbit="", tile="", lon=m[2], lat=m[3], sample_bin="dry",
+                        perm_source="JRC_GSW_v1.4", sar_file=f"dry_season_2022/sar/{cid}.tif",
+                        label_file=f"dry_season_2022/labels/{cid}.tif", location_split=m[1], **st, **qc(stack, labels)))
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tuwien-sar")
     ap.add_argument("--tuwien-masks")
     ap.add_argument("--chips")
     ap.add_argument("--s1f")
+    ap.add_argument("--dry", help="folder with DRY_*.tif dry-season chips + dry_meta_part*.json")
     ap.add_argument("--jrc", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--only", choices=["tuwien", "s1f"])
+    ap.add_argument("--only", choices=["tuwien", "s1f", "dry"])
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--stop", type=int, default=None)
     a = ap.parse_args()
     out = Path(a.out)
     jrc, jrc_files = jrc_reader(a.jrc)
-    for name, fn, sub in (("tuwien", build_tuwien, "tuwien_pakistan_2022"), ("s1f", build_s1f, "sen1floods11_pakistan_2017")):
+    for name, fn, sub in (("tuwien", build_tuwien, "tuwien_pakistan_2022"), ("s1f", build_s1f, "sen1floods11_pakistan_2017"),
+                          ("dry", build_dry, "dry_season_2022")):
         if a.only and a.only != name:
+            continue
+        if name == "dry" and not a.dry:
             continue
         rows = fn(a, jrc, out / sub)
         if not rows:

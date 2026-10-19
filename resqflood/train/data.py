@@ -26,15 +26,17 @@ def read_manifest(root):
     return list(csv.DictReader(open(Path(root) / "02_splits" / "manifest.csv")))
 
 
-def select_rows(rows, split, include_aux=False, train_qc=True):
+def select_rows(rows, split, include_aux=False, train_qc=True, include_dry=False):
     keep = {split}
     if include_aux and split == "train":
         keep.add("train_aux_s1f_weak")
+    if include_dry and split in ("train", "val"):
+        keep.add(split + "_dry")
     out = []
     for r in rows:
         if r["split"] not in keep:
             continue
-        if split == "train" and train_qc and r["use_for_training"] != "True":
+        if r["split"].startswith("train") and train_qc and r["use_for_training"] != "True":
             continue
         out.append(r)
     return out
@@ -103,8 +105,9 @@ class TrainChips(Dataset):
     """Random crops with flips/rot90, calibration jitter and water-biased crop centres."""
 
     def __init__(self, cache: ChipCache, target="water", crop=384, epoch_mult=2, water_bias=0.5,
-                 gain_db=1.0, noise=0.03, seed=42):
+                 gain_db=1.0, noise=0.03, seed=42, scale=(0.75, 1.33)):
         self.c, self.target, self.crop = cache, target, crop
+        self.scale = scale
         self.n = len(cache.rows) * epoch_mult
         self.water_bias, self.gain_db, self.noise = water_bias, gain_db, noise
         self.rng = np.random.default_rng(seed)
@@ -125,7 +128,10 @@ class TrainChips(Dataset):
         x = self.c.x[i]
         y = self.c.target(i, self.target)
         H, W = y.shape
-        cs = min(self.crop, H, W)
+        out_cs = min(self.crop, H, W)
+        # scale augmentation: crop a larger/smaller window and resize to out_cs (robust to 10-30 m pixels)
+        sc = rng.uniform(*self.scale) if self.scale and self.scale[1] > self.scale[0] else 1.0
+        cs = int(np.clip(round(out_cs / sc), 64, min(H, W)))
         if rng.random() < self.water_bias and (y == 1).any():
             ys, xs = np.nonzero(y == 1)
             j = rng.integers(len(ys))
@@ -144,7 +150,12 @@ class TrainChips(Dataset):
             xc = xc + (rng.uniform(-self.gain_db, self.gain_db) * self.gain_vec)[:, None, None] * valid
         if self.noise > 0:
             xc = xc + rng.normal(0, self.noise, xc.shape).astype("float32")
-        return torch.from_numpy(np.ascontiguousarray(xc, dtype="float32")), torch.from_numpy(np.ascontiguousarray(yc).astype("int64"))
+        xt = torch.from_numpy(np.ascontiguousarray(xc, dtype="float32"))
+        yt = torch.from_numpy(np.ascontiguousarray(yc).astype("int64"))
+        if cs != out_cs:
+            xt = torch.nn.functional.interpolate(xt[None], size=(out_cs, out_cs), mode="bilinear", align_corners=False)[0]
+            yt = torch.nn.functional.interpolate(yt[None, None].float(), size=(out_cs, out_cs), mode="nearest")[0, 0].long()
+        return xt, yt
 
 
 def worker_init(_):

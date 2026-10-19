@@ -43,7 +43,14 @@ def main():
     s["cell"] = ""
     s["split"] = np.where(s.label_type == "hand", "test_external_s1f_hand", "train_aux_s1f_weak")
 
-    df = pd.concat([t, s], ignore_index=True)
+    dry_csv = sorted(cd.glob("dry_season_2022_chips_*.csv"))
+    parts = [t, s]
+    if dry_csv:
+        dr = pd.concat([pd.read_csv(p) for p in dry_csv], ignore_index=True)
+        dr["cell"] = ""
+        dr["split"] = dr.location_split.map({"train": "train_dry", "val": "val_dry", "test": "test_dry"})
+        parts.append(dr.drop(columns=["location_split"]))
+    df = pd.concat(parts, ignore_index=True)
     # QC flags
     flags = []
     for _, r in df.iterrows():
@@ -56,7 +63,8 @@ def main():
             f.append("no_permanent_water_ref")
         flags.append(";".join(f))
     df["qc_flags"] = flags
-    df["use_for_training"] = df.split.isin(["train", "train_aux_s1f_weak"]) & ~df.qc_flags.str.contains("low_valid|label_sar_disagree")
+    df["use_for_training"] = (df.split.isin(["train", "train_aux_s1f_weak"]) & ~df.qc_flags.str.contains("low_valid|label_sar_disagree")) | \
+        ((df.split == "train_dry") & ~df.qc_flags.str.contains("low_valid"))
     df.to_csv(out / "manifest.csv", index=False)
     for sp in sorted(df.split.unique()):
         (out / f"{sp}.txt").write_text("\n".join(df[df.split == sp].chip_id) + "\n")

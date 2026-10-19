@@ -35,3 +35,15 @@ def test_db_roundtrip():
     db = np.array([-23.456, np.nan], "float32")
     i = td.db_to_i16(db)
     assert i[0] == -2346 and i[1] == td.NODATA_I16
+
+
+def test_detector_fusion_fallback_only():
+    from resqflood.detect import FloodDetector
+    rng = np.random.default_rng(1)
+    vv = np.full((128, 128), 0.1, "float32") * rng.gamma(4.4, 1 / 4.4, (128, 128)).astype("float32")
+    vv[:, :64] = 0.003                      # dark half = water (-25 dB)
+    det = FloodDetector(vv_threshold_db=-15.0)
+    r = det.detect(vv, vv / 5)
+    assert r["mode"].startswith("fallback")
+    assert r["verdict"] == "FLOOD DETECTED"
+    assert (r["classes"][:, :60] == 2).mean() > 0.95 and (r["classes"][:, 70:] == 0).mean() > 0.95

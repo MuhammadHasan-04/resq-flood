@@ -5,8 +5,8 @@ Example (Windows, from the ResQFlood folder):
 
 Default = the main configuration from docs/TRAINING_PLAN.md:
 U-Net + ResNet-34 (ImageNet) + scSE attention, input [VV_lee, VH_lee, VV-VH], target "water",
-BCE+Dice, AdamW 3e-4, cosine with 3 warm-up epochs, 80 epochs, EMA 0.999, AMP, 384 px crops,
-early stopping on validation IoU (patience 20).
+BCE+Dice, AdamW 3e-4, cosine with 3 warm-up epochs, 50 epochs (full schedule, best epoch kept),
+EMA 0.999, AMP, 384 px crops with 0.75-1.33 zoom augmentation.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from resqflood.train.core import EMA, BCEDiceLoss, Confusion, build_unet, predict_prob  # noqa: E402
+from resqflood.train.core import EMA, Confusion, build_unet, make_loss, predict_prob  # noqa: E402
 from resqflood.train.data import ChipCache, TrainChips, read_manifest, select_rows, worker_init  # noqa: E402
 
 
@@ -37,7 +37,11 @@ def parse():
     ap.add_argument("--channels", default="lee", choices=["lee", "raw", "all"])
     ap.add_argument("--target", default="water", choices=["water", "flood"])
     ap.add_argument("--include-aux", action="store_true", help="add QC-passed Sen1Floods11 weak chips to training")
-    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--include-dry", action="store_true", help="add dry-season chips (train_dry to training, val_dry to "
+                    "validation): teaches the model that dark dry ground / riverbeds are not water")
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--loss", default="bce_dice", choices=["bce_dice", "bce_lovasz"])
+    ap.add_argument("--scale-aug", type=float, nargs=2, default=[0.75, 1.33], help="random zoom range; 1 1 disables")
     ap.add_argument("--batch", type=int, default=0, help="0 = choose from GPU memory")
     ap.add_argument("--crop", type=int, default=384)
     ap.add_argument("--epoch-mult", type=int, default=2, help="random crops per chip per epoch")
@@ -46,7 +50,8 @@ def parse():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--pos-weight", type=float, default=1.0)
     ap.add_argument("--ema", type=float, default=0.999, help="0 disables EMA")
-    ap.add_argument("--patience", type=int, default=20)
+    ap.add_argument("--patience", type=int, default=0, help="early stop after N epochs without val gain; 0 = off "
+                    "(run the full cosine schedule - the LR must decay before the model settles)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--no-amp", action="store_true")
@@ -80,8 +85,8 @@ def main():
     a.batch = a.batch or auto_batch(device, a.crop)
 
     rows = read_manifest(a.data)
-    tr_rows = select_rows(rows, "train", a.include_aux)
-    va_rows = select_rows(rows, "val")
+    tr_rows = select_rows(rows, "train", a.include_aux, include_dry=a.include_dry)
+    va_rows = select_rows(rows, "val", include_dry=a.include_dry)
     if a.limit:
         tr_rows, va_rows = tr_rows[:a.limit], va_rows[:max(2, a.limit // 4)]
     print(f"train chips: {len(tr_rows)}  val chips: {len(va_rows)}  batch: {a.batch}  crop: {a.crop}")
@@ -90,7 +95,7 @@ def main():
     print("loading validation chips ...")
     va_cache = ChipCache(a.data, va_rows, a.channels)
 
-    ds = TrainChips(tr_cache, a.target, a.crop, a.epoch_mult, seed=a.seed)
+    ds = TrainChips(tr_cache, a.target, a.crop, a.epoch_mult, seed=a.seed, scale=tuple(a.scale_aug))
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, shuffle=False, drop_last=True,
                                      num_workers=a.workers, pin_memory=device.type == "cuda",
                                      worker_init_fn=worker_init if a.workers else None,
@@ -99,7 +104,7 @@ def main():
     model, used_w = build_unet(a.encoder, in_ch, a.weights, a.attention)
     model.to(device)
     ema = EMA(model, a.ema) if a.ema > 0 else None
-    loss_fn = BCEDiceLoss(pos_weight=a.pos_weight)
+    loss_fn = make_loss(a.loss, a.pos_weight)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
     steps_per_epoch = len(dl)
     total = a.epochs * steps_per_epoch
@@ -176,7 +181,7 @@ def main():
             print(f"epoch {epoch:3d}/{a.epochs}  loss {np.mean(losses):.4f}  val IoU {r['iou']:.4f}  "
                   f"F1 {r['f1']:.4f}  P {r['precision']:.3f}  R {r['recall']:.3f}  ({sec:.0f}s){flag}", flush=True)
             save(out / "last.pt", epoch)
-            if epoch - best_ep >= a.patience:
+            if a.patience and epoch - best_ep >= a.patience:
                 print(f"early stop: no val improvement for {a.patience} epochs")
                 break
     except KeyboardInterrupt:

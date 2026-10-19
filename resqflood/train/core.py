@@ -46,6 +46,44 @@ class BCEDiceLoss(torch.nn.Module):
         return self.bce_w * bce + self.dice_w * dice
 
 
+class BCELovaszLoss(torch.nn.Module):
+    """Masked BCE + Lovasz hinge (a direct surrogate of IoU, Berman et al. 2018)."""
+
+    def __init__(self, bce_w=0.5, pos_weight=1.0):
+        super().__init__()
+        self.bce = BCEDiceLoss(bce_w=1.0, dice_w=0.0, pos_weight=pos_weight)
+        self.w = bce_w
+
+    def forward(self, logits, y):
+        lov = []
+        lg = logits[:, 0].float()
+        for b in range(lg.shape[0]):
+            v = y[b] != IGNORE
+            if v.sum() == 0:
+                continue
+            lov.append(_lovasz_hinge_flat(lg[b][v], (y[b][v] == 1).float()))
+        lov = torch.stack(lov).mean() if lov else lg.sum() * 0
+        return self.w * self.bce(logits, y) + (1 - self.w) * lov
+
+
+def _lovasz_hinge_flat(logits, labels):
+    signs = 2.0 * labels - 1.0
+    errors = 1.0 - logits * signs
+    errors_sorted, perm = torch.sort(errors, descending=True)
+    gt = labels[perm]
+    gts = gt.sum()
+    inter = gts - gt.cumsum(0)
+    union = gts + (1 - gt).cumsum(0)
+    jac = 1.0 - inter / union
+    if jac.numel() > 1:
+        jac[1:] = jac[1:] - jac[:-1]
+    return torch.dot(F.relu(errors_sorted), jac)
+
+
+def make_loss(name="bce_dice", pos_weight=1.0):
+    return BCELovaszLoss(pos_weight=pos_weight) if name == "bce_lovasz" else BCEDiceLoss(pos_weight=pos_weight)
+
+
 # ------------------------------------------------------------------ metrics
 class Confusion:
     def __init__(self):

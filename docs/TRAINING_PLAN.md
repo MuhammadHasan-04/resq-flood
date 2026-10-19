@@ -67,3 +67,30 @@ Take the best configuration and train it with 3 seeds (42, 7, 123). The final mo
 - `curves.png`
 - `eval/metrics.json`, `eval/summary.md`, `eval/per_chip.csv`
 - `eval/predictions_test.png`
+
+## Version 2: changes after the first training run (M1)
+
+M1 stopped at epoch 31 of 80 because of early stopping. Its best val IoU was 0.761, at epoch 11.
+
+Why it stopped early:
+- At epoch 11 the learning rate was still at its maximum. Early stopping ended the run before the cosine schedule could lower it, so the model never "settled".
+- Validation IoU swung between 0.69 and 0.76.
+- Precision dropped in epochs 20–30, meaning more false alarms.
+
+Fixes:
+1. **No early stopping by default.** Each run uses the full 50-epoch cosine schedule and keeps the best epoch.
+2. **Zoom augmentation (0.75–1.33).** Makes the model robust to 10–30 m pixels (Sen1Floods11 and user images).
+3. **Optional Lovasz loss** (`--loss bce_lovasz`). It optimises IoU directly.
+4. **Automatic search** (`scripts/auto_tune.py`).
+   - Six configurations, chosen on val only.
+   - Then two more seeds of the winner, and a 3-model ensemble if it beats the single model on val.
+   - Result: `runs/BEST/best_model.json`.
+5. **Fused detector** (`resqflood/detect.py`).
+   - CONFIRMED flood = U-Net AND radar threshold (both agree), minus JRC permanent water.
+   - "Possible" = only one of them.
+   - If no model is available, the detector runs in fallback-only mode.
+6. **Evaluation now also reports:**
+   - fused precision;
+   - chip-level flood yes/no accuracy;
+   - pixel accuracy.
+7. **Test-case runner** (`scripts/test_cases.py`) and **browser interface** (`app/flood_app.py`).

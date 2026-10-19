@@ -100,6 +100,10 @@ class JRC:
             out = np.where(out == 255, dst, out)
         return out
 
+    def layers(self, T, crs, shape):
+        """Raw JRC layers on the grid: occurrence (0-100 %, 255 = no data) and seasonality (months 0-12, 255)."""
+        return self._sample(self.occ, T, crs, shape), self._sample(self.sea, T, crs, shape)
+
     def permanent(self, T, crs, shape):
         """Returns uint8: 1 permanent water, 0 not, 255 not covered by the tiles."""
         occ = self._sample(self.occ, T, crs, shape)

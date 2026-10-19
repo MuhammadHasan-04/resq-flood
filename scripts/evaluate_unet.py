@@ -66,7 +66,7 @@ def main():
     out = Path(a.out or Path(a.ckpt[0]).parent / "eval")
     out.mkdir(parents=True, exist_ok=True)
     rows = read_manifest(a.data)
-    splits = {s: select_rows(rows, s) for s in ["val", "test", "test_external_s1f_hand"]}
+    splits = {s: select_rows(rows, s) for s in ["val", "test", "test_external_s1f_hand", "val_dry", "test_dry"]}
     if a.limit:
         splits = {k: v[:a.limit] for k, v in splits.items()}
     vv_name = CHANNELS[cfg["channels"]][0]
@@ -84,7 +84,11 @@ def main():
         res[name] = dict(c=c, probs=probs, vv=vv_db, rows=rws)
 
     v = res["val"]
-    thr, val_iou = (a.threshold, None) if a.threshold else best_threshold(v["probs"], v["c"].water)
+    vp, vy = list(v["probs"]), list(v["c"].water)
+    if "val_dry" in res:          # dry-season validation chips also count, so false alarms on dry ground are punished
+        vp += res["val_dry"]["probs"]
+        vy += res["val_dry"]["c"].water
+    thr, val_iou = (a.threshold, None) if a.threshold else best_threshold(vp, vy)
     # baseline: one global VV threshold tuned on val
     best_vv = (-18.0, -1)
     for t in np.arange(-24, -9.9, 0.5):
@@ -105,13 +109,20 @@ def main():
             if dadu:
                 groups["test_dadu_district"] = dadu
         for gname, idx in groups.items():
-            cw, cf_, bw, bo = Confusion(), Confusion(), Confusion(), Confusion()
+            cw, cf_, bw, bo, cfu = Confusion(), Confusion(), Confusion(), Confusion(), Confusion()
+            det = Confusion()          # chip level: "is there flood in this chip?" (>= 1% of valid pixels)
             for i in idx:
                 p = r["probs"][i] >= thr
                 yw, yf, perm = r["c"].water[i], r["c"].flood[i], r["c"].perm[i]
+                fb = r["vv"][i] < best_vv[0]
                 cw.add(p, yw)
                 cf_.add(p & (perm != 1), yf)
-                bw.add(r["vv"][i] < best_vv[0], yw)
+                bw.add(fb, yw)
+                cfu.add(p & fb, yw)
+                v = yf != 255
+                truth = (yf == 1).sum() >= 0.01 * max(v.sum(), 1)
+                pred = (p & fb & (perm != 1) & v).sum() >= 0.01 * max(v.sum(), 1)
+                det.add(np.array([pred]), np.array([1 if truth else 0]))
                 bo.add(r["vv"][i] < otsu(r["vv"][i][yw != 255]), yw)
                 if gname == name:
                     one = Confusion()
@@ -121,11 +132,19 @@ def main():
                                          water_frac=rw["water_frac"], unet_iou=one.result()["iou"],
                                          unet_f1=one.result()["f1"]))
             metrics["splits"][gname] = dict(n_chips=len(idx), unet_water=cw.result(), unet_flood=cf_.result(),
+                                            fused_confirmed=cfu.result(), chip_detection=det.result(),
                                             baseline_vv_threshold=bw.result(), baseline_otsu=bo.result())
             m = metrics["splits"][gname]
             print(f"  {gname:24s} U-Net water IoU {m['unet_water']['iou']:.3f} F1 {m['unet_water']['f1']:.3f} | "
-                  f"flood IoU {m['unet_flood']['iou']:.3f} | VV-thr IoU {m['baseline_vv_threshold']['iou']:.3f} | "
+                  f"flood IoU {m['unet_flood']['iou']:.3f} | fused P {m['fused_confirmed']['precision']:.3f} | "
+                  f"chip acc {m['chip_detection']['accuracy']:.3f} | VV-thr IoU {m['baseline_vv_threshold']['iou']:.3f} | "
                   f"Otsu IoU {m['baseline_otsu']['iou']:.3f}")
+    if "val_dry" in res:              # combined validation score used for model selection (flood season + dry season)
+        cc = Confusion()
+        for r in (res["val"], res["val_dry"]):
+            for p_, y_ in zip(r["probs"], r["c"].water):
+                cc.add(p_ >= thr, y_)
+        metrics["splits"]["val_all"] = dict(n_chips=len(res["val"]["rows"]) + len(res["val_dry"]["rows"]), unet_water=cc.result())
     json.dump(metrics, open(out / "metrics.json", "w"), indent=2)
     with open(out / "per_chip.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(per_chip[0].keys()))
@@ -138,12 +157,13 @@ def main():
 
 def _summary(m, path):
     L = [f"# Evaluation  (threshold {m['threshold']}, TTA {m['tta']}, channels {m['channels']})", "",
-         "| Split | Chips | U-Net water IoU | F1 | Precision | Recall | U-Net flood IoU | VV threshold IoU | Otsu IoU |",
-         "|---|---|---|---|---|---|---|---|---|"]
+         "| Split | Chips | U-Net water IoU | F1 | Precision | Recall | Pixel accuracy | U-Net flood IoU | Fused (confirmed) IoU / precision | Chip flood yes/no accuracy | VV threshold IoU | Otsu IoU |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for k, s in m["splits"].items():
         u = s["unet_water"]
         L.append(f"| {k} | {s['n_chips']} | {u['iou']:.3f} | {u['f1']:.3f} | {u['precision']:.3f} | {u['recall']:.3f} | "
-                 f"{s['unet_flood']['iou']:.3f} | {s['baseline_vv_threshold']['iou']:.3f} | {s['baseline_otsu']['iou']:.3f} |")
+                 f"{u['accuracy']:.3f} | {s['unet_flood']['iou']:.3f} | {s['fused_confirmed']['iou']:.3f} / {s['fused_confirmed']['precision']:.3f} | "
+                 f"{s['chip_detection']['accuracy']:.3f} | {s['baseline_vv_threshold']['iou']:.3f} | {s['baseline_otsu']['iou']:.3f} |")
     Path(path).write_text("\n".join(L) + "\n")
 
 
