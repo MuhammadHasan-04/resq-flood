@@ -47,3 +47,47 @@ def test_fallback_only_when_no_model():
     fb[:50] = True
     d = decide(None, fb, valid, np.zeros_like(valid), np.zeros_like(valid), dict(DEFAULT_PARAMS), px_km2=0.0004)
     assert d["verdict"] and (d["classes"][:50] == 2).all()
+
+
+def _write_safe(tmp_path, sigma0_vv, sigma0_vh, A=400.0):
+    import zipfile
+    import rasterio
+    from rasterio.control import GroundControlPoint
+    H, W = sigma0_vv.shape
+    g = [GroundControlPoint(row=i, col=j, x=67.0 + j * 0.0002, y=27.0 - (H - i) * 0.0002, z=0)
+         for i in (0, H) for j in (0, W)] + [GroundControlPoint(row=H / 2, col=W / 2, x=67.0 + W * 0.0001, y=27.0 - H * 0.0001, z=0)]
+    zp = tmp_path / "S1A_IW_GRDH_TEST.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        for pol, s0 in (("vv", sigma0_vv), ("vh", sigma0_vh)):
+            n = f"s1a-iw-grd-{pol}-20220830t000000-001"
+            f = tmp_path / f"{n}.tiff"
+            with rasterio.open(f, "w", driver="GTiff", height=H, width=W, count=1, dtype="uint16") as o:
+                o.gcps = (g, "EPSG:4326")
+                o.write((np.sqrt(s0) * A).astype("uint16")[::-1], 1)
+            z.write(f, f"X.SAFE/measurement/{n}.tiff")
+            z.writestr(f"X.SAFE/annotation/calibration/calibration-{n}.xml",
+                       "<calibration><calibrationVectorList>" + "".join(
+                           f"<calibrationVector><line>{ln}</line><pixel>0 {W - 1}</pixel><sigmaNought>{A} {A}</sigmaNought>"
+                           "</calibrationVector>" for ln in (0, H)) + "</calibrationVectorList></calibration>")
+    return zp
+
+
+def test_sentinel1_grd_zip_is_calibrated_and_georeferenced(tmp_path):
+    from resqflood.sar_io import load_any
+    rng = np.random.default_rng(0)
+    vv = (10 ** (rng.uniform(-14, -6, (120, 160)) / 10)).astype("float32")
+    zp = _write_safe(tmp_path, vv, vv / 5)
+    d = load_any([str(zp)])
+    assert d["crs"] == "EPSG:4326" and d["vh"] is not None
+    assert abs(np.nanmedian(10 * np.log10(d["vv"])) - np.median(10 * np.log10(vv))) < 0.5      # true sigma0 kept
+    assert abs(np.nanmedian(10 * np.log10(d["vv"] / d["vh"])) - 10 * np.log10(5)) < 0.2       # VV/VH ratio kept
+
+
+def test_zip_that_is_not_sentinel1_is_refused(tmp_path):
+    import zipfile
+    from resqflood.sar_io import load_any
+    zp = tmp_path / "photos.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        z.writestr("a.txt", "hello")
+    with pytest.raises(InputError):
+        load_any([str(zp)])

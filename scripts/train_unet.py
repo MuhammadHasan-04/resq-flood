@@ -24,7 +24,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from resqflood.train.core import EMA, Confusion, build_unet, make_loss, predict_prob  # noqa: E402
-from resqflood.train.data import ChipCache, TrainChips, read_manifest, select_rows, worker_init  # noqa: E402
+from resqflood.train.data import ChipCache, TrainChips, read_manifest, select_rows, to_single_pol, worker_init  # noqa: E402
 
 
 def parse():
@@ -57,6 +57,9 @@ def parse():
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="debug: use only N chips per split")
     ap.add_argument("--resume", default="", help="path to last.pt to continue")
+    ap.add_argument("--init", default="", help="start from the weights of this best.pt (fine-tuning)")
+    ap.add_argument("--single-pol", action="store_true", help="train/validate on VV-only inputs (VH approximated exactly "
+                    "as the detector does for single-polarisation GeoTIFFs and PNG/JPG images)")
     return ap.parse_args()
 
 
@@ -94,6 +97,10 @@ def main():
     tr_cache = ChipCache(a.data, tr_rows, a.channels)
     print("loading validation chips ...")
     va_cache = ChipCache(a.data, va_rows, a.channels)
+    if a.single_pol:
+        to_single_pol(tr_cache)
+        to_single_pol(va_cache)
+        print("single-polarisation mode: VH replaced by VV - mean(VV-VH) in training and validation")
 
     ds = TrainChips(tr_cache, a.target, a.crop, a.epoch_mult, seed=a.seed, scale=tuple(a.scale_aug))
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, shuffle=False, drop_last=True,
@@ -102,6 +109,9 @@ def main():
                                      persistent_workers=a.workers > 0)
     in_ch = tr_cache.x[0].shape[0]
     model, used_w = build_unet(a.encoder, in_ch, a.weights, a.attention)
+    if a.init:
+        model.load_state_dict(torch.load(a.init, map_location="cpu", weights_only=False)["model"])
+        print("initialised from", a.init)
     model.to(device)
     ema = EMA(model, a.ema) if a.ema > 0 else None
     loss_fn = make_loss(a.loss, a.pos_weight)

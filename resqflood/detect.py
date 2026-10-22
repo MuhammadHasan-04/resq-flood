@@ -85,6 +85,12 @@ def sliding_prob(models, x, device, tile=512, overlap=128, tta=True):
     return acc / np.maximum(wsum, 1e-6)
 
 
+def synth_vh(vv_lin, stats=None):
+    """Single-polarisation input (VV only, e.g. every PNG/JPG): VH approximated with the mean VV/VH ratio of the training data."""
+    ratio = stats["channels"]["VV_minus_VH_lee7_dB"]["mean"] if stats else 6.9
+    return vv_lin / (10 ** (ratio / 10))
+
+
 def jrc_masks(occ, sea, valid, params, verdict_zone=False):
     """occ / sea: JRC layers on the grid (255 = no data) or None.
     Returns permanent, seasonal (map class) and - with verdict_zone=True - the 'normally wet' zone used by the verdict."""
@@ -152,6 +158,9 @@ class FloodDetector:
         self.params = dict(DEFAULT_PARAMS, t_high=unet_threshold, t_low=unet_threshold)
         if params:
             self.params.update(params)
+        # separate settings for single-polarisation input (VV only / PNG / JPG), tuned on validation by tune_detector
+        self.params_vv_only, self.vv_threshold_db_vv_only = None, None
+        self.models_vv, self.vv_ckpts = [], []         # optional U-Net trained on VV-only input (scripts/train_unet.py --single-pol)
         self.unet_threshold = self.params["t_high"]
         if ckpts and self.stats:
             try:
@@ -169,6 +178,24 @@ class FloodDetector:
         elif ckpts and not self.stats:
             self.error = "norm_stats.json not found"
 
+    def load_vv_models(self, ckpts):
+        """Load the single-polarisation U-Net(s); used only for VV-only / PNG / JPG input."""
+        import torch
+        from resqflood.train.core import build_unet
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            for p in ckpts:
+                ck = torch.load(p, map_location=self.device, weights_only=False)
+                c = ck["config"]
+                m, _ = build_unet(c["encoder"], c["in_channels"], "none", c.get("attention", "scse"))
+                m.load_state_dict(ck["model"])
+                self.models_vv.append(m.to(self.device).eval())
+            self.vv_ckpts = [str(p) for p in ckpts]
+        except Exception as e:
+            self.models_vv = []
+            self.error = f"single-polarisation model not loaded ({type(e).__name__}: {e})"
+
     @classmethod
     def from_model_file(cls, path, jrc_dir=None, **kw):
         """A model folder (best.pt + eval/metrics.json [+ detector.json]) or a best_model.json (M2)."""
@@ -184,23 +211,41 @@ class FloodDetector:
             base = p.parent
             spec["checkpoints"] = [c if os.path.isabs(c) else str((base / c).resolve()) for c in spec["checkpoints"]]
             dj = p.parent / "detector.json"
-        params = None
+        params, d = None, {}
         if dj.exists():
             d = json.load(open(dj))
             params = d["params"]
             spec["vv_threshold_db"] = d.get("vv_threshold_db", spec.get("vv_threshold_db"))
         ns = kw.pop("norm_stats", None) or spec.get("norm_stats")
-        return cls(spec["checkpoints"], ns, spec.get("unet_threshold", 0.5), spec.get("vv_threshold_db"),
-                   jrc_dir or spec.get("jrc_dir"), params=params, **kw)
+        det = cls(spec["checkpoints"], ns, spec.get("unet_threshold", 0.5), spec.get("vv_threshold_db"),
+                  jrc_dir or spec.get("jrc_dir"), params=params, **kw)
+        vv_ck = [c if os.path.isabs(c) else str((dj.parent / c).resolve()) for c in d.get("checkpoints_vv_only", [])]
+        if vv_ck and det.models and all(Path(c).exists() for c in vv_ck):
+            det.load_vv_models(vv_ck)
+        if d.get("params_vv_only"):
+            det.params_vv_only = dict(DEFAULT_PARAMS, **d["params_vv_only"])
+            det.vv_threshold_db_vv_only = d.get("vv_threshold_db_vv_only", det.vv_threshold_db)
+        return det
 
     @property
     def mode(self):
-        return "U-Net + fallback (fused)" if self.models else "fallback only (radar threshold)"
+        if not self.models:
+            return "fallback only (radar threshold)"
+        return "U-Net + fallback (fused)" + (" · single-pol U-Net for VV-only/PNG" if self.models_vv else "")
 
     # ------------------------------------------------------------------ pieces (also used by tune_detector)
-    def unet_prob(self, stack, valid):
-        x = normalise(stack, valid, self.stats, self.cfg["channels"])
-        return sliding_prob(self.models, x, self.device, tta=self.tta)
+    def unet_prob(self, stack, valid, single_pol=False):
+        # run the model only on the bounding box of the valid pixels: a large empty (no-data) block would otherwise
+        # be seen as "average land" and lower the probabilities in the rest of the image
+        prob = np.zeros(valid.shape, "float32")
+        rows, cols = np.flatnonzero(valid.any(1)), np.flatnonzero(valid.any(0))
+        if rows.size == 0:
+            return prob
+        r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+        x = normalise(stack[:, r0:r1, c0:c1], valid[r0:r1, c0:c1], self.stats, self.cfg["channels"])
+        models = self.models_vv if (single_pol and self.models_vv) else self.models
+        prob[r0:r1, c0:c1] = sliding_prob(models, x, self.device, tta=self.tta)
+        return prob
 
     def jrc_layers(self, transform, crs, shape, notes):
         from rasterio.transform import array_bounds
@@ -222,25 +267,33 @@ class FloodDetector:
         """vv_lin / vh_lin: linear backscatter on one grid (NaN = no data). vh may be None (single polarisation).
         ref_vv_lin / ref_vh_lin: optional PRE-FLOOD image on the same grid; its water is treated as permanent."""
         notes = []
-        if vh_lin is None:
-            ratio = self.stats["channels"]["VV_minus_VH_lee7_dB"]["mean"] if self.stats else 6.9
-            vh_lin = vv_lin / (10 ** (ratio / 10))
-            notes.append("Only one polarisation (VV) available: VH approximated, U-Net reliability is reduced.")
+        params, vv_thr = self.params, self.vv_threshold_db
+        single_pol = vh_lin is None
+        if single_pol:
+            vh_lin = synth_vh(vv_lin, self.stats)
+            if self.params_vv_only and self.models:
+                params, vv_thr = self.params_vv_only, self.vv_threshold_db_vv_only
+                notes.append("Only one polarisation (VV, or a greyscale PNG/JPG): VH approximated; "
+                             + ("the single-polarisation U-Net and " if self.models_vv else "")
+                             + "detector settings tuned for single-polarisation input are used.")
+            else:
+                notes.append("Only one polarisation (VV) available: VH approximated, U-Net reliability is reduced.")
         stack, valid = td.sar_stack(vv_lin.astype("float32"), vh_lin.astype("float32"), enl=4.4)
         if valid.sum() < 100:
-            raise ValueError("the image contains no valid radar pixels")
+            from resqflood.sar_io import InputError
+            raise InputError("the image contains no valid radar pixels")
         vv_lee = stack[2]
-        thr_db = self.vv_threshold_db if self.vv_threshold_db is not None else otsu(vv_lee[valid])
+        thr_db = vv_thr if vv_thr is not None else otsu(vv_lee[valid])
         fb = (vv_lee < thr_db) & valid
         prob = None
         if self.models:
             try:
-                prob = self.unet_prob(stack, valid)
+                prob = self.unet_prob(stack, valid, single_pol=single_pol)
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
                 notes.append(f"U-Net failed ({self.error}); fallback used alone.")
         if _water_only:
-            p = self.params
+            p = params
             return (((prob >= p["t_high"]) | ((prob >= p["t_low"]) & fb)) & valid) if prob is not None else fb
         perm_sources = []
         occ = sea = None
@@ -248,7 +301,7 @@ class FloodDetector:
             occ, sea = self.jrc_layers(transform, crs, valid.shape, notes)
             if occ is not None:
                 perm_sources.append("JRC Global Surface Water")
-        perm, seasonal, vzone = jrc_masks(occ, sea, valid, self.params, verdict_zone=True)
+        perm, seasonal, vzone = jrc_masks(occ, sea, valid, params, verdict_zone=True)
         if ref_vv_lin is not None:
             if ref_vv_lin.shape != valid.shape:
                 notes.append("Reference image has a different size from the flood image; it was ignored.")
@@ -264,7 +317,7 @@ class FloodDetector:
             px_km2 = abs(transform.a * transform.e) * (111.32 ** 2) * np.cos(np.deg2rad(lat))
         else:
             px_km2 = (pixel_m / 1000) ** 2
-        d = decide(prob, fb, valid, perm, seasonal, self.params, px_km2, verdict_zone=vzone)
+        d = decide(prob, fb, valid, perm, seasonal, params, px_km2, verdict_zone=vzone)
         st = d["stats"]
         nv = st["nvalid"]
         if prob is None:
@@ -272,7 +325,8 @@ class FloodDetector:
         flood_px = int(d["flood"].sum())
         return dict(
             verdict="FLOOD DETECTED" if d["verdict"] else "NO FLOOD DETECTED",
-            mode=self.mode if prob is not None else "fallback only (radar threshold)",
+            mode=(("U-Net (single-polarisation model) + fallback (fused)" if single_pol and self.models_vv
+                   else "U-Net + fallback (fused)") if prob is not None else "fallback only (radar threshold)"),
             flood_pct=round(100 * flood_px / nv, 2), flood_km2=round(flood_px * px_km2, 2),
             confirmed_by_both_pct=round(100 * st["both_px"] / nv, 2),
             flood_in_seasonal_zone_km2=round(st["seasonal_flood_px"] * px_km2, 2),
@@ -281,7 +335,8 @@ class FloodDetector:
             permanent_water_km2=round(st["perm_px"] * px_km2, 2), seasonal_water_km2=round(st["seasonal_px"] * px_km2, 2),
             permanent_water_source=" + ".join(perm_sources) if perm_sources else "not removed",
             valid_pct=round(100 * valid.mean(), 1), vv_threshold_db=round(float(thr_db), 2),
-            unet_thresholds=dict(t_high=self.params["t_high"], t_low=self.params["t_low"]) if prob is not None else None,
+            unet_thresholds=dict(t_high=params["t_high"], t_low=params["t_low"]) if prob is not None else None,
+            polarisation="VV only (single)" if single_pol else "VV + VH (dual)",
             notes=notes, classes=d["classes"], prob=prob, fallback=fb, vv_lee_db=vv_lee, valid=valid,
             # backwards-compatible names
             confirmed_flood_pct=round(100 * flood_px / nv, 2), confirmed_flood_km2=round(flood_px * px_km2, 2))

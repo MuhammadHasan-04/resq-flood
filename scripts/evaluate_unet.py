@@ -159,11 +159,14 @@ def _summary(m, path):
     L = [f"# Evaluation  (threshold {m['threshold']}, TTA {m['tta']}, channels {m['channels']})", "",
          "| Split | Chips | U-Net water IoU | F1 | Precision | Recall | Pixel accuracy | U-Net flood IoU | Fused (confirmed) IoU / precision | Chip flood yes/no accuracy | VV threshold IoU | Otsu IoU |",
          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    def g(s, k, f):
+        v = s.get(k, {}).get(f)
+        return f"{v:.3f}" if isinstance(v, (int, float)) else "–"
     for k, s in m["splits"].items():
-        u = s["unet_water"]
-        L.append(f"| {k} | {s['n_chips']} | {u['iou']:.3f} | {u['f1']:.3f} | {u['precision']:.3f} | {u['recall']:.3f} | "
-                 f"{u['accuracy']:.3f} | {s['unet_flood']['iou']:.3f} | {s['fused_confirmed']['iou']:.3f} / {s['fused_confirmed']['precision']:.3f} | "
-                 f"{s['chip_detection']['accuracy']:.3f} | {s['baseline_vv_threshold']['iou']:.3f} | {s['baseline_otsu']['iou']:.3f} |")
+        L.append(f"| {k} | {s['n_chips']} | {g(s, 'unet_water', 'iou')} | {g(s, 'unet_water', 'f1')} | "
+                 f"{g(s, 'unet_water', 'precision')} | {g(s, 'unet_water', 'recall')} | {g(s, 'unet_water', 'accuracy')} | "
+                 f"{g(s, 'unet_flood', 'iou')} | {g(s, 'fused_confirmed', 'iou')} / {g(s, 'fused_confirmed', 'precision')} | "
+                 f"{g(s, 'chip_detection', 'accuracy')} | {g(s, 'baseline_vv_threshold', 'iou')} | {g(s, 'baseline_otsu', 'iou')} |")
     Path(path).write_text("\n".join(L) + "\n")
 
 

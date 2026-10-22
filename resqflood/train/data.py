@@ -82,13 +82,40 @@ class ChipCache:
         if use_disk_cache:
             try:
                 cache_f.parent.mkdir(exist_ok=True)
-                obj = lambda L: np.array(L, dtype=object) if len({a.shape for a in L}) > 1 else np.stack(L)  # noqa: E731
+                def obj(L):
+                    if len({a.shape for a in L}) == 1:
+                        return np.stack(L)
+                    arr = np.empty(len(L), dtype=object)      # chips of different sizes (e.g. Sen1Floods11 256 px)
+                    for i_, a_ in enumerate(L):
+                        arr[i_] = a_
+                    return arr
                 np.savez(cache_f, x=obj(self.x), water=obj(self.water), flood=obj(self.flood), perm=obj(self.perm))
             except Exception as e:
                 print("[warn] could not write chip cache:", e)
 
     def target(self, i, name):
         return self.water[i] if name == "water" else self.flood[i]
+
+
+def to_single_pol(cache):
+    """Turn every chip into what the detector sees for a VV-only input (single-polarisation GeoTIFF, PNG, JPG):
+    VH = VV - mean(VV-VH) dB, so the VV-VH band is constant. Used to train the single-polarisation model."""
+    if cache.channels != "lee":
+        raise SystemExit("--single-pol needs --channels lee")
+    st, clip = cache.stats["channels"], cache.stats["clip_db"]
+    m = st["VV_minus_VH_lee7_dB"]["mean"]
+    s0, s1, s2 = st["VV_lee7_dB"], st["VH_lee7_dB"], st["VV_minus_VH_lee7_dB"]
+    for i, x in enumerate(cache.x):
+        x = x.astype("float32")
+        nod = np.all(x == 0, axis=0)
+        vv = x[0] * s0["std"] + s0["mean"]
+        vh = np.clip(vv - m, *clip["VH"])
+        z1 = (vh - s1["mean"]) / s1["std"]
+        z2 = np.full_like(vv, (m - s2["mean"]) / s2["std"])
+        out = np.stack([x[0], z1, z2])
+        out[:, nod] = 0
+        cache.x[i] = np.clip(out, -6, 6).astype("float16")
+    return cache
 
 
 def _rescale(x, w, f, p, s):
@@ -155,6 +182,10 @@ class TrainChips(Dataset):
         if cs != out_cs:
             xt = torch.nn.functional.interpolate(xt[None], size=(out_cs, out_cs), mode="bilinear", align_corners=False)[0]
             yt = torch.nn.functional.interpolate(yt[None, None].float(), size=(out_cs, out_cs), mode="nearest")[0, 0].long()
+        if out_cs < self.crop:      # smaller chips (e.g. Sen1Floods11 at 20 m = 256 px): pad, padding is ignored by the loss
+            pad = self.crop - out_cs
+            xt = torch.nn.functional.pad(xt, (0, pad, 0, pad), value=0.0)
+            yt = torch.nn.functional.pad(yt, (0, pad, 0, pad), value=IGNORE)
         return xt, yt
 
 

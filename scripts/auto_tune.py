@@ -133,7 +133,11 @@ def main():
     run([PY, "scripts/tune_detector.py", "--model", str(final_dir / "best_model.json"), "--data", a.data])
     run([PY, "scripts/test_cases.py", "--model", str(final_dir / "best_model.json"), "--data", a.data,
          "--out", str(ROOT / "runs" / "TEST_CASES_M2")])
-    print("\nDONE. Compare: runs/M1_unet_r34_lee/detector_eval/DETECTOR_REPORT.md  vs  runs/M2/detector_eval/DETECTOR_REPORT.md")
+    # full verification (every scenario, format and edge case) for M2 and, for comparison, M1
+    run([PY, "scripts/full_verification.py", "--model", str(final_dir / "best_model.json"), "--data", a.data])
+    if (old / "best.pt").exists() and not (old / "verification" / "VERIFICATION_REPORT.md").exists():
+        run([PY, "scripts/full_verification.py", "--model", str(old), "--data", a.data])
+    print("\nDONE. Compare:\n  runs/M2/verification/VERIFICATION_REPORT.md\n  runs/M1_unet_r34_lee/verification/VERIFICATION_REPORT.md")
 
 
 def _write_board(board):

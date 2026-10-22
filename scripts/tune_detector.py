@@ -27,7 +27,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scipy import ndimage  # noqa: E402
-from resqflood.detect import DEFAULT_PARAMS, FloodDetector, decide, jrc_masks  # noqa: E402
+from resqflood.detect import DEFAULT_PARAMS, FloodDetector, decide, jrc_masks, synth_vh  # noqa: E402
 from resqflood.sar import training_data as td  # noqa: E402
 from resqflood.train.data import read_manifest  # noqa: E402
 from test_cases import DADU, load_chip  # noqa: E402
@@ -35,15 +35,18 @@ from test_cases import DADU, load_chip  # noqa: E402
 SPLITS = ["val", "test", "test_external_s1f_hand", "val_dry", "test_dry"]
 
 
-def collect(det, data, rows, cache_f, log_every=10):
+def collect(det, data, rows, cache_f, log_every=10, vv_only=False):
+    """vv_only=True: the VH band is dropped and approximated exactly as the app does for VV-only GeoTIFFs and PNG/JPG."""
     if cache_f.exists():
         z = np.load(cache_f, allow_pickle=True)
         return z["chips"].tolist()
     chips, t0 = [], time.time()
     for i, r in enumerate(rows):
         vv, vh, T, crs, lab = load_chip(data, r)
+        if vv_only:
+            vh = synth_vh(vv, det.stats)
         stack, valid = td.sar_stack(vv, vh, enl=4.4)
-        prob = det.unet_prob(stack, valid) if det.models else None
+        prob = det.unet_prob(stack, valid, single_pol=vv_only) if det.models else None
         notes = []
         occ, sea = det.jrc_layers(T, crs, valid.shape, notes) if det.jrc_dir else (None, None)
         lat = T.f + T.e * valid.shape[0] / 2
@@ -57,7 +60,7 @@ def collect(det, data, rows, cache_f, log_every=10):
     return chips
 
 
-def collect_pre(det, pre_dir, cache_f, log_every=10):
+def collect_pre(det, pre_dir, cache_f, log_every=10, vv_only=False):
     """Pre-monsoon (Mar-May 2022) Sentinel-1 chips of river/lake locations: real scenes with permanent water and
     NO flood. Truth: flood = 0 everywhere (the 2022 floods started in June); water truth unknown (255)."""
     import rasterio
@@ -73,8 +76,8 @@ def collect_pre(det, pre_dir, cache_f, log_every=10):
             a = src.read().astype("float32")
             T, crs = src.transform, src.crs
         a[a <= -30000] = np.nan
-        stack, valid = td.sar_stack(a[0], a[1], enl=4.4)
-        prob = det.unet_prob(stack, valid)
+        stack, valid = td.sar_stack(a[0], synth_vh(a[0], det.stats) if vv_only else a[1], enl=4.4)
+        prob = det.unet_prob(stack, valid, single_pol=vv_only)
         occ, sea = det.jrc_layers(T, crs, valid.shape, [])
         lat = T.f + T.e * valid.shape[0] / 2
         px_km2 = abs(T.a * T.e) * 111.32 ** 2 * np.cos(np.deg2rad(lat))
@@ -174,6 +177,9 @@ def main():
     ap.add_argument("--no-tta", action="store_true")
     ap.add_argument("--pre-flood", default="../outputs/FLOOD_TRAINING_DATA/00_raw_downloads/sentinel1_rtc_pre_flood_2022",
                     help="folder with pre-monsoon river/lake chips (no-flood scenario test)")
+    ap.add_argument("--skip-vv-only", action="store_true", help="do not tune the single-polarisation (VV/PNG) settings")
+    ap.add_argument("--vv-model", nargs="*", default=None, help="best.pt of the single-polarisation U-Net "
+                    "(train_unet.py --single-pol); used for VV-only / PNG / JPG input")
     a = ap.parse_args()
     mp = Path(a.model)
     mdir = mp if mp.is_dir() else mp.parent
@@ -183,6 +189,12 @@ def main():
     det = FloodDetector.from_model_file(a.model, jrc_dir=a.jrc_dir, norm_stats=norm, tta=not a.no_tta)
     if not det.models:
         raise SystemExit(f"model could not be loaded: {det.error}")
+    if a.vv_model:
+        det.models_vv = []
+        det.load_vv_models([str(Path(p).resolve()) for p in a.vv_model])
+        if not det.models_vv:
+            raise SystemExit(det.error)
+        print("single-polarisation model:", a.vv_model)
     base_thr = det.unet_threshold
     base_vv = det.vv_threshold_db
     rows = read_manifest(a.data)
@@ -201,6 +213,61 @@ def main():
     if pre_test:
         chips["river_only_pre_flood (test+other areas)"] = pre_test
 
+    params, vv_thr, s_best, cs_val = tune(val, chips.get("val_dry", []), pre_val, base_thr, base_vv)
+
+    # ---- single polarisation (VV only GeoTIFF, every PNG/JPG): same tuning on the same validation scenes, VH removed
+    vv_only = {}
+    if not a.skip_vv_only:
+        print("\n=== single-polarisation (VV only / PNG / JPG) input ===", flush=True)
+        sfx = ("_notta" if a.no_tta else "") + ("_vvmodel_" + __import__("hashlib").md5("|".join(
+            f"{c}{Path(c).stat().st_mtime}" for c in det.vv_ckpts).encode()).hexdigest()[:8]
+                                                 if det.models_vv else "")
+        for s in ["val", "val_dry", "test", "test_dry"]:
+            rs = [r for r in rows if r["split"] == s]
+            print(f"[VV only · {s}] running the detector on {len(rs)} chips ...", flush=True)
+            vv_only[s] = collect(det, a.data, rs, out / f"cache_vvonly_{s}{sfx}.npz", vv_only=True)
+        pre1 = collect_pre(det, a.pre_flood, out / f"cache_vvonly_pre_flood{sfx}.npz", vv_only=True) if pre else []
+        pv1 = [c for c in pre1 if c["split"] == "pre_flood_val"] + vv_only["val_dry"]
+        pt1 = [c for c in pre1 if c["split"] != "pre_flood_val"]
+        params1, vv_thr1, s1, cs1 = tune(vv_only["val"], vv_only["val_dry"], pv1, base_thr, base_vv)
+        if pt1:
+            vv_only["river_only_pre_flood (test+other areas)"] = pt1
+        chips.update({f"VV only · {k}": v for k, v in vv_only.items()})
+
+    # ---- 4. report on all splits
+    report = dict(model=str(a.model), tta=not a.no_tta, vv_threshold_db=vv_thr, params=params, splits={})
+    for s, cs in chips.items():
+        p_, t_ = (params1, vv_thr1) if s.startswith("VV only") else (params, vv_thr)
+        groups = {s: cs}
+        if s.endswith("test"):
+            groups[s.replace("test", "test_dadu_district")] = [c for c in cs if DADU[0] <= c["lon"] <= DADU[2] and DADU[1] <= c["lat"] <= DADU[3]]
+        for g, cc in groups.items():
+            report["splits"][g] = dict(
+                n_chips=len(cc),
+                tuned_detector=dict(**pixel_scores(cc, p_, t_, p_["seasonal_as_class"]),
+                                    **chip_scores(verdicts(cc, p_, t_))),
+                unet_alone=pixel_scores(cc, dict(DEFAULT_PARAMS, t_high=base_thr, t_low=base_thr), base_vv),
+                strict_and=pixel_scores(cc, dict(DEFAULT_PARAMS, t_high=1.01, t_low=base_thr), base_vv),
+                fallback_only=pixel_scores([dict(c, prob=None) for c in cc], p_, t_))
+    res = dict(params=params, vv_threshold_db=vv_thr, chosen_on="validation split only",
+               val_flood_iou=s_best["flood_iou"], val_chip=cs_val)
+    if vv_only:
+        if det.models_vv:
+            import os
+            res["checkpoints_vv_only"] = [os.path.relpath(c, mdir) for c in det.vv_ckpts]
+        res.update(params_vv_only=params1, vv_threshold_db_vv_only=vv_thr1, val_flood_iou_vv_only=s1["flood_iou"],
+                   val_chip_vv_only=cs1)
+        report.update(params_vv_only=params1, vv_threshold_db_vv_only=vv_thr1)
+    json.dump(res, open(mdir / "detector.json", "w"), indent=2)
+    json.dump(report, open(out / "detector_metrics.json", "w"), indent=2)
+    _md(report, out / "DETECTOR_REPORT.md")
+    print((out / "DETECTOR_REPORT.md").read_text())
+    print("detector settings saved to", mdir / "detector.json")
+
+
+def tune(val, val_dry, pre_val, base_thr, base_vv):
+    """Chooses fusion thresholds, seasonal handling and verdict rules on validation scenes only."""
+    chips = {"val_dry": val_dry}
     # ---- 1. fusion thresholds + radar threshold (val flood IoU)
     best = None
     for th, tl, dv in itertools.product([0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.01], [0.15, 0.2, 0.3, 0.4, 0.5], [-1.0, 0.0, 1.0]):
@@ -281,31 +348,15 @@ def main():
     print("verdict rules:", {k: params[k] for k in ("verdict_buffer_px", "verdict_exclude_seasonal", "verdict_seasonal_occ", "min_blob_px",
                                                      "min_frac", "min_km2")}, "->", cs_val)
 
-    # ---- 4. report on all splits
-    report = dict(model=str(a.model), tta=not a.no_tta, vv_threshold_db=vv_thr, params=params, splits={})
-    for s, cs in chips.items():
-        groups = {s: cs}
-        if s == "test":
-            groups["test_dadu_district"] = [c for c in cs if DADU[0] <= c["lon"] <= DADU[2] and DADU[1] <= c["lat"] <= DADU[3]]
-        for g, cc in groups.items():
-            report["splits"][g] = dict(
-                n_chips=len(cc),
-                tuned_detector=dict(**pixel_scores(cc, params, vv_thr, params["seasonal_as_class"]),
-                                    **chip_scores(verdicts(cc, params, vv_thr))),
-                unet_alone=pixel_scores(cc, dict(DEFAULT_PARAMS, t_high=base_thr, t_low=base_thr), base_vv),
-                strict_and=pixel_scores(cc, dict(DEFAULT_PARAMS, t_high=1.01, t_low=base_thr), base_vv),
-                fallback_only=pixel_scores([dict(c, prob=None) for c in cc], params, vv_thr))
-    json.dump(dict(params=params, vv_threshold_db=vv_thr, chosen_on="validation split only",
-                   val_flood_iou=s_best["flood_iou"], val_chip=cs_val), open(mdir / "detector.json", "w"), indent=2)
-    json.dump(report, open(out / "detector_metrics.json", "w"), indent=2)
-    _md(report, out / "DETECTOR_REPORT.md")
-    print((out / "DETECTOR_REPORT.md").read_text())
-    print("detector settings saved to", mdir / "detector.json")
-
+    return params, vv_thr, s_best, cs_val
 
 def _md(r, path):
     L = [f"# Flood detector evaluation ({r['model']})", "",
-         f"Settings chosen on the validation split only: {json.dumps(r['params'])}, radar threshold {r['vv_threshold_db']} dB.", "",
+         f"Settings chosen on the validation split only: {json.dumps(r['params'])}, radar threshold {r['vv_threshold_db']} dB.", ""]
+    if r.get("params_vv_only"):
+        L += [f"Single-polarisation input (VV only, PNG/JPG; rows 'VV only · ...'): {json.dumps(r['params_vv_only'])}, "
+              f"radar threshold {r['vv_threshold_db_vv_only']} dB.", ""]
+    L += [
          "| Split | Chips | Flood IoU | Flood F1 | Precision | Recall | Water IoU | Flood/no-flood verdict accuracy | Flood chips found | No-flood chips correct | River-only chips correct | False-flood % of pixels (no-flood scenes) | U-Net alone flood IoU | Strict AND flood IoU | Fallback only flood IoU |",
          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for k, s in r["splits"].items():

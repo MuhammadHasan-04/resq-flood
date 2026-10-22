@@ -99,6 +99,9 @@ def group_scenes(paths):
     rasters = [p for p in paths if p.suffix.lower() in RASTER_EXT]
     images = [p for p in paths if p.suffix.lower() in IMG_EXT]
     scenes, used = [], set()
+    for p in paths:                      # a complete Sentinel-1 GRD product (.zip / SAFE): one scene, calibrated
+        if p.suffix.lower() == ".zip":
+            scenes.append(dict(name=p.stem, kind="Sentinel-1 GRD .zip", files=[str(p)]))
     for p in rasters:
         if p in used:
             continue
@@ -121,7 +124,7 @@ def group_scenes(paths):
         if p.with_suffix(".bbox.txt").exists() or p.with_name(p.stem + ".bbox.txt").exists():
             side = "bbox file"
         scenes.append(dict(name=p.stem, kind="image", files=[str(p)], sidecar=side))
-    other = [p.name for p in paths if p.suffix.lower() not in RASTER_EXT + IMG_EXT + WORLD_EXT + (".txt",)]
+    other = [p.name for p in paths if p.suffix.lower() not in RASTER_EXT + IMG_EXT + WORLD_EXT + (".txt", ".zip")]
     return scenes, other
 
 
@@ -222,6 +225,8 @@ class App:
         for s in scenes:
             if s["kind"].startswith("raster"):
                 loc_note = "from the GeoTIFF"
+            elif s["kind"].startswith("Sentinel-1"):
+                loc_note = "from the product (ground control points)"
             elif s.get("sidecar"):
                 loc_note = f"from {s['sidecar']}"
             else:
@@ -425,7 +430,7 @@ def build(app: App):
         with gr.Tab("1 · Detect floods"):
             with gr.Row():
                 with gr.Column(scale=3):
-                    files = gr.File(label="Images during/after the flood (GeoTIFF, VV/VH pairs, PNG/JPG + optional "
+                    files = gr.File(label="Images during/after the flood (GeoTIFF, VV/VH pairs, Sentinel-1 GRD .zip, PNG/JPG + optional "
                                           ".pgw/.bbox.txt)", file_count="multiple", type="filepath")
                     refs = gr.File(label="Optional: PRE-FLOOD images of the same areas (water there = normal water)",
                                    file_count="multiple", type="filepath")

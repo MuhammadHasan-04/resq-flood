@@ -23,6 +23,21 @@ All thresholds are chosen by `scripts/tune_detector.py` on validation data only:
 
 They are stored in `<model>/detector.json`, and the model weights are never changed.
 
+## Single-polarisation input (VV-only GeoTIFF, every PNG/JPG)
+- A PNG/JPG is one grey band, so the radar VH band is missing. VH is approximated as VV minus the mean VV/VH ratio of the training data.
+- Such input gets its **own detector settings** (`params_vv_only` in `detector.json`), tuned on the same validation scenes with VH removed.
+- Optionally it also gets its **own U-Net** (`checkpoints_vv_only`), fine-tuned from M2 on VV-only chips (`train_unet.py --single-pol --init ...`).
+- Dual-polarisation (VV+VH) input is not affected: it keeps the M2 U-Net and its own settings.
+
+## Inputs accepted
+- GeoTIFF (linear, dB, dB×100, uint16 DN; any CRS; 1 or 2 bands; separate VV/VH files).
+- **Sentinel-1 GRD product .zip (SAFE)** as downloaded from the Copernicus Data Space:
+  - the measurement tiffs are calibrated to sigma0 with the product's own calibration table;
+  - they are georeferenced from the ground control points.
+- PNG/JPG with corners, a centre point, a world file or `<name>.bbox.txt`.
+- Rejected with a message: optical/colour images, multispectral rasters, empty, corrupted or unknown files.
+- Images with large no-data parts: the model only runs on the bounding box of the valid pixels.
+
 ## Data used to check the "river only / no flood" case
 - 282 dry-season (Jan–May 2022) Sentinel-1 RTC scenes at training, validation and test locations, labelled from 38 years of JRC history:
   - water where JRC shows permanent water;
@@ -39,6 +54,11 @@ They are stored in `<model>/detector.json`, and the model weights are never chan
 
 ## Known limits (stated honestly)
 - **PNG/JPG without location or pre-flood image**: permanent water cannot be separated, so all water counts as possible flood. The app says so.
-- **PNG/JPG inputs**: they carry only one polarisation, so VH is approximated. GeoTIFF VV+VH is always more accurate.
+- **PNG/JPG inputs**: they carry only one polarisation, so VH is approximated. GeoTIFF VV+VH is always more accurate. Section 8 of the verification measures this case separately.
+- **Optical imagery** (Google Earth, Sentinel-2, Landsat): not supported by design. Radar sees through monsoon clouds.
+- **Mountains and sandy deserts** (northern KP, Gilgit-Baltistan, Thar, Cholistan, western Balochistan) are not in the training data:
+  - radar shadow and dry sand look dark like water, so false alarms are possible there;
+  - the model is validated for the Indus floodplain.
+- **Raw GRD** is not terrain-corrected. That is fine on the plains; in mountains, use a terrain-corrected (RTC) product.
 - **Other countries / years**: the Sen1Floods11 2017 Punjab/KP hand-labelled set is much harder (flood IoU ≈ 0.18 with M1): small rivers, different processing, hand labels.
 - **Flooded vegetation and urban flooding**: these do not look dark to radar, so any radar method under-detects them.

@@ -28,7 +28,8 @@ class InputError(ValueError):
     pass
 
 
-def _to_linear(a, dtype):
+def _to_linear(a, dtype, dn_scale=None):
+    """dn_scale: for uncalibrated DN pairs the VH band must use the SAME scale as VV (keeps the VV/VH ratio)."""
     a = a.astype("float32")
     bad = ~np.isfinite(a) | (a <= -30000)
     v = a[~bad]
@@ -43,13 +44,71 @@ def _to_linear(a, dtype):
         lin, unit = 10 ** ((-25 + a / 255.0 * 25) / 10.0), "8-bit display image (assumed -25..0 dB)"
     elif dtype in ("uint16", "int32", "uint32") and np.percentile(v, 99) > 50:
         inten = a ** 2                                         # DN amplitude -> intensity
-        k = 10 ** (-9.0 / 10) / max(float(np.median(inten[~bad & (a > 0)])), 1e-12)
-        lin, unit = inten * k, "uncalibrated 16-bit amplitude (auto-scaled so typical land = -9 dB; approximate)"
+        k = dn_scale if dn_scale else 10 ** (-9.0 / 10) / max(float(np.median(inten[~bad & (a > 0)])), 1e-12)
+        lin, unit = inten * k, "uncalibrated 16-bit amplitude (auto-scaled so typical land = -9 dB VV; approximate)"
+        _to_linear.last_dn_scale = k
     else:
         lin, unit = a, "linear power"
     lin = lin.astype("float32")
     lin[bad | (lin <= 0)] = np.nan
     return lin, unit
+
+
+# ------------------------------------------------------------------ raw Sentinel-1 GRD (SAFE zip / measurement tiff)
+def _s1_cal_xml_for(tif_path):
+    """Calibration XML text for a measurement tiff inside a SAFE folder (on disk or inside a /vsizip/ path)."""
+    import zipfile
+    p = str(tif_path)
+    name = Path(p).name
+    cal_name = "calibration-" + Path(name).with_suffix(".xml").name
+    if p.startswith("/vsizip/"):
+        zpath, inner = p[len("/vsizip/"):].split(".zip/", 1)
+        with zipfile.ZipFile(zpath + ".zip") as z:
+            hit = [n for n in z.namelist() if n.endswith("/annotation/calibration/" + cal_name)]
+            return z.read(hit[0]).decode() if hit else None
+    f = Path(p).parent.parent / "annotation" / "calibration" / cal_name
+    return f.read_text() if f.exists() else None
+
+
+def _s1_sigma0_lut(xml_text, H_full, W_full, Hs, Ws):
+    """sigma0 calibration table A on the (possibly reduced) grid: sigma0 = DN^2 / A^2."""
+    import xml.etree.ElementTree as ET
+    from scipy.interpolate import RegularGridInterpolator
+    root = ET.fromstring(xml_text)
+    lines, vals, pix = [], [], None
+    for v in root.iter("calibrationVector"):
+        lines.append(int(v.find("line").text))
+        px = np.array(v.find("pixel").text.split(), float)
+        sv = np.array(v.find("sigmaNought").text.split(), float)
+        if pix is None:
+            pix = px
+        if len(sv) != len(pix):
+            sv = np.interp(pix, px, sv)
+        vals.append(sv)
+    lines = np.array(lines, float)
+    order = np.argsort(lines)
+    f = RegularGridInterpolator((lines[order], pix), np.array(vals)[order], bounds_error=False, fill_value=None)
+    rr = (np.arange(Hs) + 0.5) * H_full / Hs
+    cc = (np.arange(Ws) + 0.5) * W_full / Ws
+    R, C = np.meshgrid(rr, cc, indexing="ij")
+    return f(np.stack([R.ravel(), C.ravel()], -1)).reshape(Hs, Ws).astype("float32")
+
+
+def expand_safe_zip(path):
+    """A Sentinel-1 GRD .zip (SAFE) -> /vsizip/ paths of its VV and VH measurement tiffs (VV first)."""
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        names = [n for n in z.namelist() if "/measurement/" in n and n.lower().endswith((".tiff", ".tif"))]
+    if not names:
+        raise InputError(f"{Path(path).name} is a zip file but not a Sentinel-1 SAFE product (no measurement/*.tiff). "
+                         "Unzip it and upload the GeoTIFF(s), or upload the original Sentinel-1 GRD .zip.")
+    def pol(n):
+        n = Path(n).name.lower()
+        return next((k for k in ("vv", "hh", "vh", "hv") if f"-{k}-" in n), "zz")
+    names = sorted(names, key=lambda n: ("vv", "hh", "vh", "hv", "zz").index(pol(n)))
+    if "grd" not in Path(names[0]).name.lower():
+        raise InputError("only Sentinel-1 GRD products are supported (this SAFE looks like SLC or another level)")
+    return [f"/vsizip/{Path(path).resolve()}/{n}" for n in names[:2]]
 
 
 # ------------------------------------------------------------------ rasters
@@ -59,7 +118,8 @@ def load_geotiff(paths):
     paths = [str(p) for p in paths]
     notes = []
     if len(paths) >= 2:
-        srcs = sorted(paths, key=lambda p: ("vh" in Path(p).name.lower(), p))   # VV first
+        srcs = paths if paths[0].startswith("/vsizip/") else \
+            sorted(paths, key=lambda p: ("vh" in Path(p).name.lower() or "hv" in Path(p).name.lower(), p))   # VV first
         bands = [(srcs[0], 1), (srcs[1], 1)]
         notes.append(f"VV = {Path(srcs[0]).name}, VH = {Path(srcs[1]).name}")
     else:
@@ -79,25 +139,64 @@ def load_geotiff(paths):
         else:
             bands = [(paths[0], 1)]
     out, T, crs = [], None, None
+    dn_scale = None
     for p, b in bands:
         with rasterio.open(p) as s:
-            arr = s.read(b).astype("float32")
+            k = int(np.ceil(np.sqrt(s.width * s.height / (2 * MAX_PIXELS)))) if s.width * s.height > 2 * MAX_PIXELS else 1
+            if k > 1:       # very large file (e.g. a full Sentinel-1 GRD, ~25000 x 17000 px): read it pre-averaged
+                from rasterio.enums import Resampling as R_
+                arr = s.read(b, out_shape=(s.height // k, s.width // k), resampling=R_.average).astype("float32")
+                notes.append(f"{Path(p).name}: very large file, read at 1/{k} resolution")
+            else:
+                arr = s.read(b).astype("float32")
             if s.nodata is not None:
                 arr[arr == s.nodata] = np.nan
-            lin, unit = _to_linear(arr, s.dtypes[b - 1])
-            if s.crs is None:
+            Hs, Ws = arr.shape
+            cal = _s1_cal_xml_for(p) if (s.crs is None and s.gcps[0] and s.dtypes[b - 1] == "uint16") else None
+            if cal:          # raw Sentinel-1 GRD with its calibration table -> true sigma0
+                A = _s1_sigma0_lut(cal, s.height, s.width, Hs, Ws)
+                lin = np.where(arr > 0, arr.astype("float32") ** 2 / A ** 2, np.nan).astype("float32")
+                unit = "Sentinel-1 GRD digital numbers, calibrated to sigma0 with the product's calibration table"
+            else:
+                _to_linear.last_dn_scale = None
+                lin, unit = _to_linear(arr, s.dtypes[b - 1], dn_scale)
+                dn_scale = dn_scale or _to_linear.last_dn_scale        # VV (first band) sets the scale for VH
+                if dn_scale and s.crs is None and s.gcps[0]:
+                    notes.append("WARNING: raw Sentinel-1 GRD file without its calibration file: brightness is only "
+                                 "approximately calibrated and results may be unreliable. Upload the complete GRD .zip "
+                                 "(SAFE) or a calibrated sigma0 GeoTIFF instead.")
+            gcps, gcrs = s.gcps if s.crs is None else ([], None)
+            if k > 1 and gcps:
+                from rasterio.control import GroundControlPoint
+                gcps = [GroundControlPoint(row=g.row * Hs / s.height, col=g.col * Ws / s.width, x=g.x, y=g.y, z=g.z)
+                        for g in gcps]
+            if s.crs is None and not gcps:
                 notes.append(f"{Path(p).name}: raster without a coordinate system; treated as a plain image")
+                if lin.size > MAX_PIXELS:                   # keep memory bounded on a laptop
+                    k = int(np.ceil(np.sqrt(lin.size / MAX_PIXELS)))
+                    Hk, Wk = lin.shape[0] // k * k, lin.shape[1] // k * k
+                    lin = np.nanmean(lin[:Hk, :Wk].reshape(Hk // k, k, Wk // k, k), axis=(1, 3))
+                    notes.append(f"Large image: averaged {k}x{k} pixels to fit in memory")
                 out.append(lin)
                 continue
+            if gcps:        # e.g. a raw Sentinel-1 GRD measurement file (radar geometry + ground control points)
+                geo = dict(gcps=gcps, src_crs=gcrs)
+                notes.append(f"{Path(p).name}: georeferenced from its {len(gcps)} ground control points (raw GRD)")
+                dims = dict(gcps=gcps)
+            else:
+                geo = dict(src_transform=s.transform * s.transform.scale(s.width / Ws, s.height / Hs), src_crs=s.crs)
+                dims = {}
+            src_crs = gcrs or s.crs
+            bnds = () if gcps else tuple(s.bounds)
             res = TARGET_DEG
-            T0, W0, H0 = calculate_default_transform(s.crs, "EPSG:4326", s.width, s.height, *s.bounds, resolution=res)
+            T0, W0, H0 = calculate_default_transform(src_crs, "EPSG:4326", Ws, Hs, *bnds, resolution=res, **dims)
             if W0 * H0 > MAX_PIXELS:
                 res = TARGET_DEG * float(np.sqrt(W0 * H0 / MAX_PIXELS))
                 notes.append(f"Large scene: processed at {res * 111000:.0f} m pixels to fit in memory")
-            T, W, H = calculate_default_transform(s.crs, "EPSG:4326", s.width, s.height, *s.bounds, resolution=res)
+            T, W, H = calculate_default_transform(src_crs, "EPSG:4326", Ws, Hs, *bnds, resolution=res, **dims)
             dst = np.full((H, W), np.nan, "float32")
-            reproject(lin, dst, src_transform=s.transform, src_crs=s.crs, dst_transform=T, dst_crs="EPSG:4326",
-                      resampling=Resampling.average, src_nodata=np.nan, dst_nodata=np.nan)
+            reproject(lin, dst, dst_transform=T, dst_crs="EPSG:4326",
+                      resampling=Resampling.average, src_nodata=np.nan, dst_nodata=np.nan, **geo)
             crs = "EPSG:4326"
             out.append(dst)
             notes.append(f"{Path(p).name} band {b}: units {unit}")
@@ -153,9 +252,9 @@ def _read_grey(path):
     notes = []
     if im.mode in ("I;16", "I;16B", "I", "F"):
         g = np.asarray(im).astype("float32")
-        lo, hi = np.percentile(g, [1, 99])
-        g = np.clip((g - lo) / max(hi - lo, 1e-6) * 255, 0, 255)
-        notes.append("16-bit image stretched to 8-bit (1-99 % range)")
+        top = 65535.0 if g.max() > 255 else 255.0      # fixed scale: a contrast stretch would change the radar levels
+        g = np.clip(g / top * 255, 0, 255)
+        notes.append("16-bit image scaled to 8-bit with a fixed scale (full range = -25..0 dB)")
         return g, notes
     rgb = np.asarray(im.convert("RGB")).astype("float32")
     if im.mode in ("RGBA", "LA", "P"):
@@ -241,6 +340,21 @@ def load_any(paths, pixel_m=20.0, location=None):
     if not data_files:
         raise InputError("no image file among the uploads")
     ext = Path(data_files[0]).suffix.lower()
+    for f in data_files:
+        if Path(f).exists() and Path(f).stat().st_size == 0:
+            raise InputError(f"{Path(f).name} is an empty file (0 bytes)")
+    try:
+        return _load_any(data_files, world, ext, pixel_m, location)
+    except InputError:
+        raise
+    except Exception as e:      # unreadable / corrupted / wrong format -> clear message instead of a crash
+        raise InputError(f"{Path(data_files[0]).name} could not be read as an image ({type(e).__name__}: "
+                         f"{str(e)[:120]}). Is the file complete and really a GeoTIFF/PNG/JPG?")
+
+
+def _load_any(data_files, world, ext, pixel_m, location):
+    if ext == ".zip":
+        return load_geotiff(expand_safe_zip(data_files[0]))
     if ext in (".tif", ".tiff", ".img", ".jp2", ".vrt"):
         return load_geotiff(data_files[:2])
     if ext in IMG_EXT:
@@ -250,7 +364,7 @@ def load_any(paths, pixel_m=20.0, location=None):
             if Path(world[0]) != dst:
                 shutil.copy(world[0], dst)
         return load_image(data_files[0], pixel_m, location if location not in ("", None) else None)
-    raise InputError(f"unsupported file type '{ext}'. Use GeoTIFF (.tif) or PNG/JPG.")
+    raise InputError(f"unsupported file type '{ext}'. Use GeoTIFF (.tif), a Sentinel-1 GRD .zip or PNG/JPG.")
 
 
 def align_to(ref, target):
