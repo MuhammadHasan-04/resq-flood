@@ -3,7 +3,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from pathlib import Path
-O=Path('/home/claude/W/out'); S=Path('/home/claude/W/out_splits'); F=Path('/home/claude/W/report/fig')
+import argparse
+"""Figures of the pre-processing report.
+  python scripts/preprocessing_figures.py --data ../outputs/FLOOD_TRAINING_DATA --gadm ../outputs/datasets/gadm_pakistan_boundaries/gadm41_PAK_shp.zip"""
+_ROOT = Path(__file__).resolve().parents[1]
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--data", default=str(_ROOT.parent / "outputs" / "FLOOD_TRAINING_DATA"))
+_ap.add_argument("--gadm", default=str(_ROOT.parent / "outputs" / "datasets" / "gadm_pakistan_boundaries" / "gadm41_PAK_shp.zip"))
+_a = _ap.parse_args()
+O = Path(_a.data) / "01_chips"; S = Path(_a.data) / "02_splits"; F = Path(_a.data) / "03_report" / "figures"
+F.mkdir(parents=True, exist_ok=True)
+G = Path(_a.data) / "03_report" / "_gadm"
 plt.rcParams.update({"font.size":10,"axes.titlesize":11,"figure.dpi":110})
 d=pd.read_csv(S/'manifest.csv'); t=d[d.dataset=='tuwien_pakistan_2022']; s=d[d.dataset!='tuwien_pakistan_2022']
 def rd(cid, kind):
@@ -12,9 +22,9 @@ def rd(cid, kind):
     if kind=='sar': a=np.where(a==-32768,np.nan,a/100.)
     return a
 # 1 map
-if not Path('/home/claude/W/gadm').exists():
-    zipfile.ZipFile('/mnt/user-data/uploads/th/outputs/datasets/gadm_pakistan_boundaries/gadm41_PAK_shp.zip').extractall('/home/claude/W/gadm')
-pk=gpd.read_file('/home/claude/W/gadm/gadm41_PAK_1.shp')
+if not G.exists():
+    zipfile.ZipFile(_a.gadm).extractall(G)
+pk=gpd.read_file(G/'gadm41_PAK_1.shp')
 fig,ax=plt.subplots(figsize=(8,8)); pk.boundary.plot(ax=ax,color='#888',lw=.6)
 col={'train':'#2b7bba','val':'#f39c12','test':'#c0392b','excluded_buffer':'#999','train_aux_s1f_weak':'#27ae60','test_external_s1f_hand':'#8e44ad'}
 lab={'train':'TU Wien train','val':'TU Wien val','test':'TU Wien test (incl. Dadu)','excluded_buffer':'buffer (dropped)','train_aux_s1f_weak':'Sen1Floods11 weak (aux train)','test_external_s1f_hand':'Sen1Floods11 hand (external test)'}
